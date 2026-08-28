@@ -246,7 +246,10 @@ section "11 · Hardware drivers (Intel — X13 Gen 4)"
 # ══════════════════════════════════════════════════════════════════════════════
 # X13 Gen 4 is Intel Raptor Lake (13th gen). Kernel 7.0 in 26.04 already has
 # excellent support, but autoinstall picks up any non-free Lenovo/firmware bits.
-sudo ubuntu-drivers autoinstall || warn "ubuntu-drivers had nothing to add (likely fine)"
+# NOTE: `ubuntu-drivers autoinstall` was REMOVED in ubuntu-drivers-common 1:0.10.x.
+# The subcommands are now: debug · devices · install · list · list-oem.
+# Calling autoinstall on 26.04 just errors with "No such command".
+sudo ubuntu-drivers install || warn "ubuntu-drivers had nothing to add (likely fine on Intel-only)"
 lspci | grep -iE 'vga|3d|display' || true
 
 

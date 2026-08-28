@@ -18,3 +18,13 @@ terminal:
 ```bash
 source ~/.bashrc
 ```
+Best way: npm (official) — latest + self-updating                                                                                                                                                                                                                                                                       ```bash
+   npm install -g --ignore-scripts @earendil-works/pi-coding-agent                                                                                           ```
+ Or the official installer, which pulls the same latest release:                                                                                                                                                                                                                                                         ```bash
+   curl -fsSL https://pi.dev/install.sh | sh                                                                                                                 ```
+ Both give you the current npm version (pi publishes updates to npm continuously), and pi updates itself — it checks pi.dev/api/latest-version at startup,   and you force it anytime with:
+                                                                                                                                                             ```bash                                                                                                                                                       pi update --self        # update pi only
+   pi update --all        
+   
+# update pi + packages
+   
