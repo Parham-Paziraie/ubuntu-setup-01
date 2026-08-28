@@ -1,0 +1,7 @@
+# OBS config backups contain live secrets:
+#   - YouTube OAuth refresh + access token  (basic.ini, [YouTube])
+#   - obs-websocket server password         (plugin_config/obs-websocket/config.json)
+#   - PulseAudio cookie
+# This repo is PUBLIC. Never commit these.
+obs-backup-*/
+*.tar.gz

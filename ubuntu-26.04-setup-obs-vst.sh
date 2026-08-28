@@ -27,6 +27,10 @@
 #   - OBS         -> deb from the official obsproject PPA   (was: Flathub)
 #   - VST plugins -> lsp-plugins-vst + lsp-plugins-ladspa   (new)
 #   - NDI plugin  -> DistroAV .deb from GitHub releases     (was: Flatpak ext)
+#   - Vertical Canvas -> Aitum .deb from GitHub releases    (was: Flatpak ext)
+#   - Source Record   -> Exeldro portable tarball, relocated by hand.
+#                        No .deb exists for Linux. See section 8 for the ABI
+#                        check that says the 22.04 build is safe on 26.04.
 #   - libndi      -> installed by DistroAV's own CI/libndi-get.sh  (section 9)
 #                    The .deb contains only distroav.so; unlike the Flatpak it
 #                    does NOT bundle the NDI runtime, so we fetch it. Note the
@@ -104,9 +108,14 @@ echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docke
 #
 # NOTE: PPAs are per-release. If obsproject hasn't published a build for this
 # Ubuntu release yet, this add still succeeds but the suite 404s on update.
-# We tolerate that: universe carries obs-studio too, just an older version.
-# The VST behaviour is identical either way — it's the deb-vs-Flatpak split
-# that matters here, not the OBS version.
+#
+# THE PPA IS NOT OPTIONAL HERE. Verified 2026-08-28 by unpacking both debs:
+#   PPA      obs-studio 32.2.0-0obsproject1~resolute -> SHIPS obs-vst.so
+#   universe obs-studio 32.1.0-0ubuntu3              -> NO obs-vst.so AT ALL
+# Ubuntu builds the VST plugin out of its package (Steinberg VST2 SDK
+# licensing). Falling back to universe therefore gives you an OBS with no
+# "VST 2.x Plug-in" filter whatsoever, which defeats this whole script.
+# Section 7 asserts on this rather than letting it pass silently.
 sudo add-apt-repository -y --no-update ppa:obsproject/obs-studio \
   || warn "Could not add the obsproject PPA — falling back to Ubuntu universe OBS"
 
@@ -116,7 +125,14 @@ sudo apt update || warn "apt update reported errors (likely the OBS PPA lacking 
 # ══════════════════════════════════════════════════════════════════════════════
 section "3 · Install from repositories: VS Code · Git · Docker · Python · misc"
 # ══════════════════════════════════════════════════════════════════════════════
-sudo nala install -y \
+# ubuntu-restricted-extras Recommends ttf-mscorefonts-installer, which puts up
+# a full-screen debconf EULA that `-y` does NOT dismiss - it will sit there
+# waiting for a keypress and stall an otherwise unattended run. Pre-accept the
+# licence and force the noninteractive frontend for this one call.
+echo 'ttf-mscorefonts-installer msttcorefonts/accepted-mscorefonts-eula select true' \
+  | sudo debconf-set-selections
+
+sudo DEBIAN_FRONTEND=noninteractive nala install -y \
   code \
   git-all \
   docker-ce docker-ce-cli containerd.io docker-compose-plugin \
@@ -184,10 +200,15 @@ section "7 · OBS Studio (deb) + LSP audio plugins (the VST payload)"
 # ══════════════════════════════════════════════════════════════════════════════
 # THIS is the section that makes this script different. Read the header.
 #
-# lsp-plugins-vst drops ~200 VST2 .so files into /usr/lib/vst/lsp-plugins/.
-# The deb OBS scans /usr/lib/vst (recursing into subdirs), so they show up in
-# Filters → Add → "VST 2.x Plug-in" with zero configuration. Among them:
-#     graph-equalizer-x16-mono.so   →  "Graphic Equalizer x16 Mono"
+# lsp-plugins-vst (1.2.27) drops 195 VST2 .so files into
+#     /usr/lib/vst/lsp-plugins.vst/          <- note the ".vst" suffix
+# NOT /usr/lib/vst/lsp-plugins/ . Verified with `dpkg -c` on the deb.
+#
+# obs-vst.so has /usr/lib/vst/ compiled into its search path list and walks it
+# with QDirIterator + a "*.so" name filter, i.e. recursively - so the plugins
+# in that subdirectory are found with zero configuration. Among them:
+#     graph-equalizer-x16-mono.so   ->  "Graphic Equalizer x16 Mono"
+#     para-equalizer-x16-*.so       ->  matches obs/parametric equlizer x16.cfg
 #
 # lsp-plugins-ladspa is not used by OBS itself, but it's what EasyEffects and
 # PipeWire filter-chains consume — cheap to install, and it pulls in the same
@@ -199,13 +220,30 @@ sudo nala install -y \
 
 obs --version || true
 
-# Sanity check: did the VST payload actually land where OBS looks?
-if compgen -G "/usr/lib/vst/lsp-plugins/graph-equalizer-x16-*.so" > /dev/null; then
-  ok "LSP VSTs installed — $(ls /usr/lib/vst/lsp-plugins/*.so | wc -l) plugins in /usr/lib/vst/lsp-plugins"
-  info "In OBS: Filters → + → VST 2.x Plug-in → 'Graphic Equalizer x16 Mono'"
+# --- Assert 1: does THIS OBS build even have a VST filter? -------------------
+# The universe build does not (see section 2). Without obs-vst.so there is no
+# "VST 2.x Plug-in" entry in the filter list no matter how many .so files are
+# sitting in /usr/lib/vst, so fail loudly here instead of at 2am mid-stream.
+OBS_VST_SO="/usr/lib/x86_64-linux-gnu/obs-plugins/obs-vst.so"
+if [[ -f "$OBS_VST_SO" ]]; then
+  ok "obs-vst.so present - this OBS has the VST 2.x filter"
 else
-  warn "Expected LSP VSTs in /usr/lib/vst/lsp-plugins but found none."
-  warn "Check:  dpkg -L lsp-plugins-vst | grep vst"
+  warn "NO obs-vst.so in /usr/lib/x86_64-linux-gnu/obs-plugins/"
+  warn "You are almost certainly on the Ubuntu universe OBS, which is built"
+  warn "WITHOUT VST support. Check that the PPA actually took:"
+  warn "   apt-cache policy obs-studio     # want 'obsproject' as the origin"
+  warn "Fix the PPA and re-run, or this script has achieved nothing."
+fi
+
+# --- Assert 2: did the VST payload land where OBS looks? --------------------
+LSP_VST_DIR="/usr/lib/vst/lsp-plugins.vst"
+if compgen -G "${LSP_VST_DIR}/graph-equalizer-x16-*.so" > /dev/null; then
+  ok "LSP VSTs installed - $(find "$LSP_VST_DIR" -name '*.so' | wc -l) plugins in ${LSP_VST_DIR}"
+  info "In OBS: Filters -> + -> VST 2.x Plug-in -> 'Graphic Equalizer x16 Mono'"
+else
+  warn "Expected LSP VSTs in ${LSP_VST_DIR} but found none."
+  warn "Check where the package actually put them:"
+  warn "   dpkg -L lsp-plugins-vst | grep '\.so$' | head"
 fi
 
 # Belt and braces: OBS also honours VST_PATH. Only set it if the packaged
@@ -215,7 +253,7 @@ grep -qxF 'export VST_PATH=/usr/lib/vst:$HOME/.vst' "$HOME/.profile" 2>/dev/null
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-section "8 · DistroAV (NDI) plugin — .deb build"
+section "8 · OBS plugins - DistroAV (NDI) · Vertical Canvas · Source Record"
 # ══════════════════════════════════════════════════════════════════════════════
 # DistroAV is the renamed OBS-NDI plugin (since 2024-06). Because OBS is now a
 # deb, we need the deb build of the plugin — the Flatpak extension cannot load
@@ -238,6 +276,73 @@ else
   warn "Grab the current .deb from https://github.com/DistroAV/DistroAV/releases"
   rm -f "/tmp/${DISTROAV_DEB}"
 fi
+
+
+# --- Vertical Canvas (Aitum) -------------------------------------------------
+# The 1080x1920 shorts canvas. This is what the whole vertical workflow in
+# obs-config.md is built on, so it is not optional if you want that back.
+# Ships a proper .deb with `Depends: obs-studio`, same 1.6.4 as the old
+# Flatpak extension.
+VC_VERSION="1.6.4"
+VC_DEB="vertical-canvas-linux-gnu.deb"
+VC_URL="https://github.com/Aitum/obs-vertical-canvas/releases/download/${VC_VERSION}/${VC_DEB}"
+
+if wget -q --show-progress -O "/tmp/${VC_DEB}" "$VC_URL"; then
+  sudo nala install -y "/tmp/${VC_DEB}"
+  sudo apt --fix-broken install -y || true
+  rm -f "/tmp/${VC_DEB}"
+  ok "Vertical Canvas ${VC_VERSION} installed"
+else
+  warn "Could not download Vertical Canvas ${VC_VERSION}."
+  warn "Latest: https://github.com/Aitum/obs-vertical-canvas/releases"
+  rm -f "/tmp/${VC_DEB}"
+fi
+
+
+# --- Source Record (Exeldro) -------------------------------------------------
+# Drives the "Source Record (youtube)" filter on the webcam - records one
+# source to its own file independently of the main recording.
+#
+# NO .deb exists for Linux; upstream publishes only a portable tarball built on
+# Ubuntu 22.04. That is fine here, verified 2026-08-28 against OBS 32.2.0:
+#   - it links ONLY libobs.so.0, libobs-frontend-api.so.0 and libc.so.6
+#     (no Qt at all, so no Qt6 ABI risk)
+#   - highest symbol version it needs is GLIBC_2.34; 26.04 ships 2.43
+#   - all 170 libobs symbols it imports are defined by the 32.2.0 libobs
+#
+# Tarball layout is OBS's portable one, so the files are relocated by hand:
+#   source-record/bin/64bit/source-record.so -> /usr/lib/<triplet>/obs-plugins/
+#   source-record/data/*                     -> /usr/share/obs/obs-plugins/source-record/
+#
+# CAVEAT: installed outside dpkg. apt will never update or remove it. To undo:
+#   sudo rm /usr/lib/x86_64-linux-gnu/obs-plugins/source-record.so
+#   sudo rm -rf /usr/share/obs/obs-plugins/source-record
+SR_VERSION="0.4.8"
+SR_TGZ="source-record-${SR_VERSION}-ubuntu-22.04.tar.gz"
+SR_URL="https://github.com/exeldro/obs-source-record/releases/download/${SR_VERSION}/${SR_TGZ}"
+SR_TMP="$(mktemp -d)"
+
+if wget -q --show-progress -O "${SR_TMP}/${SR_TGZ}" "$SR_URL"; then
+  tar xzf "${SR_TMP}/${SR_TGZ}" -C "$SR_TMP"
+
+  if [[ -f "${SR_TMP}/source-record/bin/64bit/source-record.so" ]]; then
+    sudo install -Dm644 \
+      "${SR_TMP}/source-record/bin/64bit/source-record.so" \
+      "/usr/lib/x86_64-linux-gnu/obs-plugins/source-record.so"
+    sudo mkdir -p /usr/share/obs/obs-plugins/source-record
+    sudo cp -r "${SR_TMP}/source-record/data/." \
+      /usr/share/obs/obs-plugins/source-record/
+    ok "Source Record ${SR_VERSION} installed (manual, not dpkg-tracked)"
+  else
+    warn "Source Record tarball had an unexpected layout - skipping."
+    warn "Expected source-record/bin/64bit/source-record.so. Got:"
+    find "$SR_TMP" -name '*.so' | sed 's/^/     /' || true
+  fi
+else
+  warn "Could not download Source Record ${SR_VERSION}."
+  warn "Latest: https://github.com/exeldro/obs-source-record/releases"
+fi
+rm -rf "$SR_TMP"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -396,10 +501,12 @@ ok "NormCap bound to Super+Shift+T"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-section "ghosty terminal"
+section "14 · Ghostty terminal"
 # ══════════════════════════════════════════════════════════════════════════════
-sudo apt update
-sudo apt install ghostty
+# Ghostty is in the 26.04 universe archive, so plain apt works. -y matters:
+# without it this prompts, and under `set -e` a declined prompt kills the run
+# on its very last step.
+sudo apt install -y ghostty
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -410,8 +517,9 @@ cat <<'SUMMARY'
 Installed:
   • Dev:      VS Code · Git · Node (nvm + LTS) · NestJS · Turbo · Claude Code
   •           Docker CE + Compose plugin · Python 3 + pipx + auto-editor
-  • Media:    OBS Studio (deb, obsproject PPA) + DistroAV NDI plugin
-  •           LSP audio plugins (VST2 + LADSPA) — usable as OBS audio filters
+  • Media:    OBS Studio (deb, obsproject PPA)
+  •           OBS plugins: DistroAV (NDI) · Vertical Canvas · Source Record
+  •           LSP audio plugins (VST2 + LADSPA) - usable as OBS audio filters
   •           Shotcut · ubuntu-restricted-extras
   • Comms:    Zoom · Telegram
   • Tools:    NormCap (OCR screen capture, Super+Shift+T)
@@ -442,7 +550,12 @@ Manual next steps:
   7. (Optional) Sign in to Claude Code:  claude  → /login
 
 If the VST list in OBS is empty:
-  - Confirm the files exist:  ls /usr/lib/vst/lsp-plugins/ | head
+  - Confirm THIS OBS was built with VST support at all:
+       ls /usr/lib/x86_64-linux-gnu/obs-plugins/obs-vst.so
+    Missing means you are on the universe OBS, which has no VST filter.
+    Check the PPA took:  apt-cache policy obs-studio   (origin: obsproject)
+  - Confirm the plugin files exist (note the ".vst" suffix on the dir):
+       ls /usr/lib/vst/lsp-plugins.vst/ | head
   - Confirm you launched the DEB OBS, not a leftover Flatpak:
        which obs          # should be /usr/bin/obs
        flatpak list | grep -i obs   # should be empty
