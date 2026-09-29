@@ -1,0 +1,9 @@
+# Symlink manifest used by install.sh.
+# Format: <path inside dotfiles/>   <target path in $HOME>
+# Each target becomes a symlink to ~/.dotfiles/<path>.
+# Add a line here, then run ./install.sh.
+
+claude/CLAUDE.md                     .claude/CLAUDE.md
+claude/VOICE.md                      .claude/VOICE.md
+claude/settings.json                 .claude/settings.json
+agents/hooks                         .agents/hooks
