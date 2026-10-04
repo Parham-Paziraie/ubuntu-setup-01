@@ -72,7 +72,7 @@ It is idempotent, so you can run it any number of times.
 - Add `export NAME=value` to `shell/claude-env.sh`.
 - Keep behavior toggles here, not in the `env` block of `settings.json`, because Claude can rewrite `settings.json` and silently drop them.
 - Current toggles:
-  - `CLAUDE_CODE_AUTO_COMPACT_WINDOW=50000`: auto-compact starts when the context gets near 50k tokens.
+  - `CLAUDE_CODE_AUTO_COMPACT_WINDOW=500000`: auto-compact starts when the context gets near 500k tokens.
 
 ## Undo
 
