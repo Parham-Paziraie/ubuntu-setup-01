@@ -8,42 +8,64 @@
 #   chmod +x ubuntu-26.04-setup-obs-vst.sh
 #   ./ubuntu-26.04-setup-obs-vst.sh
 #
+# LAYOUT
+# -----------------------------------------------------------------------------
+# This script builds the machine. Everything OBS-related was split out into
+# obs-vst-setup.sh, which section 7 invokes:
+#
+#     ubuntu-26.04-setup-obs-vst.sh        <- you are here
+#       1  base toolchain
+#       2  third-party repos (VS Code, Docker CE)
+#       3  apt packages
+#       4  Docker group      5  Node/nvm      6  Python/pipx
+#       7  ── ./obs-vst-setup.sh ───────────┐
+#       10 Flatpak + NormCap                │
+#       11 comms   12 drivers   13 GNOME   14 Ghostty
+#                                           │
+#     obs-vst-setup.sh  <───────────────────┘
+#       obsproject PPA + mandatory-PPA guard
+#       obs-studio + lsp-plugins-vst (the whole point)
+#       XWayland launcher so VST editor windows can open without a SIGSEGV
+#       DistroAV (NDI) · Vertical Canvas · Source Record, with their stale
+#         libqt6*t64 dependency names retargeted to the 26.04 package names
+#       libndi runtime · Avahi · UFW ports
+#       plugin verification roll-up
+#
+# obs-vst-setup.sh is standalone: run it on its own to rebuild only the OBS rig.
+# Section numbers 8, 9 and 15 are retired; they moved there wholesale.
+#
 # HOW THIS DIFFERS FROM ubuntu-26.04-setup.sh
 # -----------------------------------------------------------------------------
-# This variant exists for ONE reason: audio VST filters in OBS.
+# This variant exists for ONE reason: audio VST filters in OBS, which needs the
+# deb OBS rather than the Flatpak. The full reasoning now lives in the
+# obs-vst-setup.sh header. Short version: the Flatpak OBS hard-sets
+# VST_PATH=/app/extensions/Plugins/vst in its manifest, so it scans ONLY that
+# sandbox directory and can never see host VSTs in /usr/lib/vst. The deb has no
+# such override.
 #
-#   The Flatpak OBS hard-sets  VST_PATH=/app/extensions/Plugins/vst  in its
-#   manifest, so it scans ONLY that sandbox directory and can never see host
-#   VSTs in /usr/lib/vst — even though the Flatpak holds filesystems=host.
-#   Result: an empty VST filter list unless you also install a Flatpak
-#   LinuxAudio plugin extension.
-#
-#   The deb OBS has no such override. It scans the normal host paths, so
-#   `apt install lsp-plugins-vst` is all it takes to get the LSP suite
-#   (Graphic Equalizer x16 Mono, compressors, gates, etc.) into
-#   Filters → Add → VST 2.x Plug-in.
-#
-# So, versus the Flatpak script:
-#   - OBS         -> deb from the official obsproject PPA   (was: Flathub)
-#   - VST plugins -> lsp-plugins-vst + lsp-plugins-ladspa   (new)
-#   - NDI plugin  -> DistroAV .deb from GitHub releases     (was: Flatpak ext)
-#   - Vertical Canvas -> Aitum .deb from GitHub releases    (was: Flatpak ext)
-#   - Source Record   -> Exeldro portable tarball, relocated by hand.
-#                        No .deb exists for Linux. See section 8 for the ABI
-#                        check that says the 22.04 build is safe on 26.04.
-#   - libndi      -> installed by DistroAV's own CI/libndi-get.sh  (section 9)
-#                    The .deb contains only distroav.so; unlike the Flatpak it
-#                    does NOT bundle the NDI runtime, so we fetch it. Note the
-#                    upstream script auto-accepts NewTek's SDK EULA (`yes |`).
-#   - Avahi       -> host daemon only; no `flatpak override` needed
-#   - Launcher    -> the deb ships its own .desktop; no custom entry
-#   - NormCap     -> still Flatpak (unchanged)
-#
-# Other decisions carried over unchanged:
+# Decisions carried over unchanged:
 #   - Node.js     -> nvm
 #   - Docker      -> official Docker CE repo  (NOT docker.io)
 #   - VS Code     -> Microsoft apt repo       (NOT snap)
-#   - apt UI      -> nala installed in Section 1, used from there on
+#   - NormCap     -> Flatpak
+#   - apt UI      -> nala installed in Section 1, used from there on, EXCEPT
+#                    for local .deb files, which go through apt
+#
+# RE-RUNNING THIS SCRIPT
+# -----------------------------------------------------------------------------
+# It is idempotent by design and re-running is the supported repair path.
+# Installing an already-installed apt package is a no-op, and the snap, Flatpak
+# and .bashrc steps all check before they act. So if a step fails, fix the cause
+# and just run it again - it retries only what is missing.
+#
+# Failures are collected in FAILURES, replayed at the end, and make the script
+# exit 1. That includes a non-zero exit from obs-vst-setup.sh.
+#
+# NEVER pipe a producer into `grep -q` in this script. `grep -q` exits on its
+# first match, killing a still-writing producer with SIGPIPE (141); under
+# `set -o pipefail` the pipeline then reports 141 even though grep matched, so
+# the check answers "no" precisely when the truth is "yes". Capture to a
+# variable and match that instead.
 #
 # 26.04 facts that shape this script:
 #   - Wayland-only (Xorg session removed). The deb OBS still does screen
@@ -62,6 +84,12 @@ section() { echo -e "\n${CYAN}════════════════�
 warn()    { echo -e "${YELLOW}⚠  $1${RESET}"; }
 info()    { echo -e "${CYAN}ℹ  $1${RESET}"; }
 ok()      { echo -e "${GREEN}✓  $1${RESET}"; }
+
+# Anything that lands in FAILURES is replayed in the closing summary and makes
+# the script exit non-zero, so a broken OBS/plugin never hides behind 600 lines
+# of scrollback that ended in a cheerful "Setup complete".
+FAILURES=()
+fail()    { echo -e "${RED}✗  $1${RESET}"; FAILURES+=("$1"); }
 
 # Refuse to run as root — Flatpak --user, nvm, pipx all need real $HOME
 if [[ $EUID -eq 0 ]]; then
@@ -87,12 +115,17 @@ section "2 · Add third-party APT repositories (VS Code + Docker CE + OBS)"
 # ══════════════════════════════════════════════════════════════════════════════
 # Doing all repo setup together so we only apt-update once afterwards.
 
+# Scratch space for every transient download in this script. Removed on exit,
+# success or failure, so an aborted run never leaves a half-written .deb in
+# /tmp that a later `wget -c` would then try to resume into.
+WORKDIR="$(mktemp -d)"
+trap 'rm -rf "$WORKDIR"' EXIT
+
 # --- VS Code (Microsoft) ---
 wget -qO- https://packages.microsoft.com/keys/microsoft.asc \
-  | gpg --dearmor > packages.microsoft.gpg
-sudo install -o root -g root -m 644 packages.microsoft.gpg /etc/apt/trusted.gpg.d/
+  | gpg --dearmor > "$WORKDIR/packages.microsoft.gpg"
+sudo install -o root -g root -m 644 "$WORKDIR/packages.microsoft.gpg" /etc/apt/trusted.gpg.d/
 sudo sh -c 'echo "deb [arch=amd64,arm64,armhf signed-by=/etc/apt/trusted.gpg.d/packages.microsoft.gpg] https://packages.microsoft.com/repos/code stable main" > /etc/apt/sources.list.d/vscode.list'
-rm -f packages.microsoft.gpg
 
 # --- Docker CE (official) ---
 sudo install -m 0755 -d /usr/share/keyrings
@@ -102,24 +135,12 @@ sudo chmod a+r /usr/share/keyrings/docker-archive-keyring.gpg
 echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" \
   | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
 
-# --- OBS Studio (official obsproject PPA) ---
-# Ships a much newer OBS than Ubuntu universe. `add-apt-repository` runs its own
-# apt-get update by default; --no-update defers that to the single update below.
-#
-# NOTE: PPAs are per-release. If obsproject hasn't published a build for this
-# Ubuntu release yet, this add still succeeds but the suite 404s on update.
-#
-# THE PPA IS NOT OPTIONAL HERE. Verified 2026-08-28 by unpacking both debs:
-#   PPA      obs-studio 32.2.0-0obsproject1~resolute -> SHIPS obs-vst.so
-#   universe obs-studio 32.1.0-0ubuntu3              -> NO obs-vst.so AT ALL
-# Ubuntu builds the VST plugin out of its package (Steinberg VST2 SDK
-# licensing). Falling back to universe therefore gives you an OBS with no
-# "VST 2.x Plug-in" filter whatsoever, which defeats this whole script.
-# Section 7 asserts on this rather than letting it pass silently.
-sudo add-apt-repository -y --no-update ppa:obsproject/obs-studio \
-  || warn "Could not add the obsproject PPA — falling back to Ubuntu universe OBS"
+# --- OBS Studio ---
+# The obsproject PPA is NOT set up here. It lives in obs-vst-setup.sh together
+# with everything else OBS-related, so that script stays runnable on its own.
+# See section 7 below.
 
-sudo apt update || warn "apt update reported errors (likely the OBS PPA lacking a build for $(lsb_release -cs))"
+sudo apt update
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -178,8 +199,18 @@ npm --version
 
 npm install -g \
   @nestjs/cli \
-  turbo \
-  @anthropic-ai/claude-code
+  turbo
+
+# Claude Code is deliberately NOT in that list. Its native installer puts a
+# binary in ~/.local/bin, which sits ahead of nvm's bin on PATH - so adding the
+# npm package on top gives you two independently self-updating copies where the
+# npm one is permanently shadowed. Only install it if nothing already provides
+# `claude`.
+if command -v claude >/dev/null 2>&1; then
+  info "claude already on PATH ($(command -v claude)) - skipping the npm package"
+else
+  npm install -g @anthropic-ai/claude-code
+fi
 set -u
 
 
@@ -196,226 +227,28 @@ pipx install auto-editor || warn "auto-editor already installed — skipping"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-section "7 · OBS Studio (deb) + LSP audio plugins (the VST payload)"
+section "7 · OBS Studio + audio VST rig  (delegated)"
 # ══════════════════════════════════════════════════════════════════════════════
-# THIS is the section that makes this script different. Read the header.
+# Everything OBS-related lives in obs-vst-setup.sh: the obsproject PPA and its
+# mandatory-PPA guard, obs-studio, the LSP VST payload, DistroAV/NDI, Vertical
+# Canvas, Source Record, libndi, Avahi and the plugin verification roll-up.
 #
-# lsp-plugins-vst (1.2.27) drops 195 VST2 .so files into
-#     /usr/lib/vst/lsp-plugins.vst/          <- note the ".vst" suffix
-# NOT /usr/lib/vst/lsp-plugins/ . Verified with `dpkg -c` on the deb.
-#
-# obs-vst.so has /usr/lib/vst/ compiled into its search path list and walks it
-# with QDirIterator + a "*.so" name filter, i.e. recursively - so the plugins
-# in that subdirectory are found with zero configuration. Among them:
-#     graph-equalizer-x16-mono.so   ->  "Graphic Equalizer x16 Mono"
-#     para-equalizer-x16-*.so       ->  matches obs/parametric equlizer x16.cfg
-#
-# lsp-plugins-ladspa is not used by OBS itself, but it's what EasyEffects and
-# PipeWire filter-chains consume — cheap to install, and it pulls in the same
-# shared DSP core. Keep them together.
-sudo nala install -y \
-  obs-studio \
-  lsp-plugins-vst \
-  lsp-plugins-ladspa
+# It is standalone - it installs its own prerequisites and uses plain apt - so
+# you can run it on its own to rebuild just the OBS rig without re-running this
+# whole script. That is also why it is a separate process here rather than
+# sourced: its `exit 1` on a dead PPA should not kill this script's remaining
+# sections, and its FAILURES array stays its own.
+OBS_SCRIPT="$(dirname "$(readlink -f "$0")")/obs-vst-setup.sh"
 
-obs --version || true
-
-# --- Assert 1: does THIS OBS build even have a VST filter? -------------------
-# The universe build does not (see section 2). Without obs-vst.so there is no
-# "VST 2.x Plug-in" entry in the filter list no matter how many .so files are
-# sitting in /usr/lib/vst, so fail loudly here instead of at 2am mid-stream.
-OBS_VST_SO="/usr/lib/x86_64-linux-gnu/obs-plugins/obs-vst.so"
-if [[ -f "$OBS_VST_SO" ]]; then
-  ok "obs-vst.so present - this OBS has the VST 2.x filter"
+if [[ ! -x "$OBS_SCRIPT" ]]; then
+  fail "obs-vst-setup.sh not found or not executable at ${OBS_SCRIPT}"
+  warn "The OBS/VST rig was skipped entirely. Fetch it alongside this script and run:"
+  warn "   ./obs-vst-setup.sh"
+elif "$OBS_SCRIPT"; then
+  ok "OBS/VST rig complete"
 else
-  warn "NO obs-vst.so in /usr/lib/x86_64-linux-gnu/obs-plugins/"
-  warn "You are almost certainly on the Ubuntu universe OBS, which is built"
-  warn "WITHOUT VST support. Check that the PPA actually took:"
-  warn "   apt-cache policy obs-studio     # want 'obsproject' as the origin"
-  warn "Fix the PPA and re-run, or this script has achieved nothing."
+  fail "obs-vst-setup.sh reported failures - see its own summary above"
 fi
-
-# --- Assert 2: did the VST payload land where OBS looks? --------------------
-LSP_VST_DIR="/usr/lib/vst/lsp-plugins.vst"
-if compgen -G "${LSP_VST_DIR}/graph-equalizer-x16-*.so" > /dev/null; then
-  ok "LSP VSTs installed - $(find "$LSP_VST_DIR" -name '*.so' | wc -l) plugins in ${LSP_VST_DIR}"
-  info "In OBS: Filters -> + -> VST 2.x Plug-in -> 'Graphic Equalizer x16 Mono'"
-else
-  warn "Expected LSP VSTs in ${LSP_VST_DIR} but found none."
-  warn "Check where the package actually put them:"
-  warn "   dpkg -L lsp-plugins-vst | grep '\.so$' | head"
-fi
-
-# Belt and braces: OBS also honours VST_PATH. Only set it if the packaged
-# location somehow isn't the default on this release. Harmless when unused.
-grep -qxF 'export VST_PATH=/usr/lib/vst:$HOME/.vst' "$HOME/.profile" 2>/dev/null \
-  || echo 'export VST_PATH=/usr/lib/vst:$HOME/.vst' >> "$HOME/.profile"
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-section "8 · OBS plugins - DistroAV (NDI) · Vertical Canvas · Source Record"
-# ══════════════════════════════════════════════════════════════════════════════
-# DistroAV is the renamed OBS-NDI plugin (since 2024-06). Because OBS is now a
-# deb, we need the deb build of the plugin — the Flatpak extension cannot load
-# into a host OBS.
-#
-# The .deb declares `Depends: obs-studio`, so it must be installed AFTER
-# section 7. It contains exactly one binary, /usr/lib/x86_64-linux-gnu/
-# obs-plugins/distroav.so — and crucially NO libndi. See section 9.
-DISTROAV_VERSION="6.2.1"
-DISTROAV_DEB="distroav-${DISTROAV_VERSION}-x86_64-linux-gnu.deb"
-DISTROAV_URL="https://github.com/DistroAV/DistroAV/releases/download/${DISTROAV_VERSION}/${DISTROAV_DEB}"
-
-if wget -q --show-progress -O "/tmp/${DISTROAV_DEB}" "$DISTROAV_URL"; then
-  sudo nala install -y "/tmp/${DISTROAV_DEB}"
-  sudo apt --fix-broken install -y || true
-  rm -f "/tmp/${DISTROAV_DEB}"
-  ok "DistroAV ${DISTROAV_VERSION} installed"
-else
-  warn "Could not download DistroAV ${DISTROAV_VERSION}."
-  warn "Grab the current .deb from https://github.com/DistroAV/DistroAV/releases"
-  rm -f "/tmp/${DISTROAV_DEB}"
-fi
-
-
-# --- Vertical Canvas (Aitum) -------------------------------------------------
-# The 1080x1920 shorts canvas. This is what the whole vertical workflow in
-# obs-config.md is built on, so it is not optional if you want that back.
-# Ships a proper .deb with `Depends: obs-studio`, same 1.6.4 as the old
-# Flatpak extension.
-VC_VERSION="1.6.4"
-VC_DEB="vertical-canvas-linux-gnu.deb"
-VC_URL="https://github.com/Aitum/obs-vertical-canvas/releases/download/${VC_VERSION}/${VC_DEB}"
-
-if wget -q --show-progress -O "/tmp/${VC_DEB}" "$VC_URL"; then
-  sudo nala install -y "/tmp/${VC_DEB}"
-  sudo apt --fix-broken install -y || true
-  rm -f "/tmp/${VC_DEB}"
-  ok "Vertical Canvas ${VC_VERSION} installed"
-else
-  warn "Could not download Vertical Canvas ${VC_VERSION}."
-  warn "Latest: https://github.com/Aitum/obs-vertical-canvas/releases"
-  rm -f "/tmp/${VC_DEB}"
-fi
-
-
-# --- Source Record (Exeldro) -------------------------------------------------
-# Drives the "Source Record (youtube)" filter on the webcam - records one
-# source to its own file independently of the main recording.
-#
-# NO .deb exists for Linux; upstream publishes only a portable tarball built on
-# Ubuntu 22.04. That is fine here, verified 2026-08-28 against OBS 32.2.0:
-#   - it links ONLY libobs.so.0, libobs-frontend-api.so.0 and libc.so.6
-#     (no Qt at all, so no Qt6 ABI risk)
-#   - highest symbol version it needs is GLIBC_2.34; 26.04 ships 2.43
-#   - all 170 libobs symbols it imports are defined by the 32.2.0 libobs
-#
-# Tarball layout is OBS's portable one, so the files are relocated by hand:
-#   source-record/bin/64bit/source-record.so -> /usr/lib/<triplet>/obs-plugins/
-#   source-record/data/*                     -> /usr/share/obs/obs-plugins/source-record/
-#
-# CAVEAT: installed outside dpkg. apt will never update or remove it. To undo:
-#   sudo rm /usr/lib/x86_64-linux-gnu/obs-plugins/source-record.so
-#   sudo rm -rf /usr/share/obs/obs-plugins/source-record
-SR_VERSION="0.4.8"
-SR_TGZ="source-record-${SR_VERSION}-ubuntu-22.04.tar.gz"
-SR_URL="https://github.com/exeldro/obs-source-record/releases/download/${SR_VERSION}/${SR_TGZ}"
-SR_TMP="$(mktemp -d)"
-
-if wget -q --show-progress -O "${SR_TMP}/${SR_TGZ}" "$SR_URL"; then
-  tar xzf "${SR_TMP}/${SR_TGZ}" -C "$SR_TMP"
-
-  if [[ -f "${SR_TMP}/source-record/bin/64bit/source-record.so" ]]; then
-    sudo install -Dm644 \
-      "${SR_TMP}/source-record/bin/64bit/source-record.so" \
-      "/usr/lib/x86_64-linux-gnu/obs-plugins/source-record.so"
-    sudo mkdir -p /usr/share/obs/obs-plugins/source-record
-    sudo cp -r "${SR_TMP}/source-record/data/." \
-      /usr/share/obs/obs-plugins/source-record/
-    ok "Source Record ${SR_VERSION} installed (manual, not dpkg-tracked)"
-  else
-    warn "Source Record tarball had an unexpected layout - skipping."
-    warn "Expected source-record/bin/64bit/source-record.so. Got:"
-    find "$SR_TMP" -name '*.so' | sed 's/^/     /' || true
-  fi
-else
-  warn "Could not download Source Record ${SR_VERSION}."
-  warn "Latest: https://github.com/exeldro/obs-source-record/releases"
-fi
-rm -rf "$SR_TMP"
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-section "9 · NDI host requirements — libndi · Avahi daemon · firewall ports"
-# ══════════════════════════════════════════════════════════════════════════════
-sudo nala install -y avahi-daemon ffmpeg
-sudo systemctl enable --now avahi-daemon
-
-# --- libndi: the NDI runtime -------------------------------------------------
-# The Flatpak DistroAV extension bundles the NDI runtime. The .deb does not —
-# it ships exactly one file, distroav.so. So we install libndi ourselves using
-# DistroAV's own helper, which is the method their install docs prescribe:
-# it pulls the NDI SDK v6 tarball from downloads.ndi.tv, drops the libs into
-# /usr/local/lib, runs ldconfig, and symlinks libndi.so.6 -> libndi.so.5 so
-# older plugin builds keep working.
-#
-# HEADS UP: that upstream script runs NewTek's SDK installer as `yes | sh ...`,
-# i.e. it accepts the NDI SDK licence on your behalf without showing it to you.
-# If you'd rather read the EULA first, skip this block and run OBS once —
-# DistroAV shows a dialog with the same download.
-#
-# We download to a file and run it rather than piping curl into a root shell,
-# so you can actually read it before it executes.
-if ldconfig -p | grep -q 'libndi'; then
-  ok "NDI runtime already present on this host — skipping libndi install"
-else
-  info "Installing the NDI runtime via DistroAV's libndi-get.sh..."
-  LIBNDI_GET="/tmp/libndi-get.sh"
-  LIBNDI_GET_URL="https://raw.githubusercontent.com/DistroAV/DistroAV/refs/heads/master/CI/libndi-get.sh"
-
-  if curl -fsSL -o "$LIBNDI_GET" "$LIBNDI_GET_URL"; then
-    chmod +x "$LIBNDI_GET"
-    if sudo "$LIBNDI_GET" install; then
-      sudo ldconfig
-      if ldconfig -p | grep -q 'libndi'; then
-        ok "NDI runtime installed: $(ldconfig -p | grep -m1 libndi | awk '{print $NF}')"
-      else
-        warn "libndi-get.sh finished but libndi is still not on the linker path."
-        warn "Check /usr/local/lib and that it's covered by /etc/ld.so.conf.d/."
-      fi
-    else
-      warn "libndi-get.sh failed (downloads.ndi.tv unreachable, or SDK layout changed)."
-      warn "Launch OBS once and accept DistroAV's download prompt instead."
-    fi
-    rm -f "$LIBNDI_GET"
-  else
-    warn "Could not fetch libndi-get.sh — NDI sources will not work yet."
-    warn "Launch OBS once and accept DistroAV's download prompt, or see:"
-    warn "   https://github.com/DistroAV/DistroAV/wiki/1.-Installation"
-  fi
-fi
-
-# UFW rules for NDI. Only applied if ufw is installed AND active.
-if command -v ufw >/dev/null 2>&1 && sudo ufw status | grep -q "Status: active"; then
-  info "Configuring UFW rules for NDI..."
-  sudo ufw allow 5353/udp                  # mDNS (Avahi)
-  sudo ufw allow 5959:5969/tcp
-  sudo ufw allow 5959:5969/udp
-  sudo ufw allow 6960:6970/tcp
-  sudo ufw allow 6960:6970/udp
-  sudo ufw allow 7960:7970/tcp
-  sudo ufw allow 7960:7970/udp
-  sudo ufw allow 5960/tcp
-  ok "UFW rules added for NDI"
-else
-  info "UFW inactive — skipping firewall rules (NDI works without UFW on home LAN)"
-fi
-
-# No `flatpak override --system-talk-name=org.freedesktop.Avahi` here: the deb
-# OBS is not sandboxed and talks to the host Avahi directly.
-# No custom .desktop entry either — obs-studio ships /usr/share/applications/
-# com.obsproject.Studio.desktop, and a hand-rolled duplicate would just show up
-# twice in Activities.
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -426,35 +259,62 @@ section "10 · Flatpak: Flathub + NormCap"
 # tesseract-ocr package. Screen grabbing goes through the xdg-desktop-portal
 # Screenshot interface, which is the only thing that works under 26.04's
 # Wayland-only session.
-sudo flatpak remote-add --if-not-exists flathub \
+#
+# --system on BOTH calls is not cosmetic. If flathub is ALSO registered in the
+# user installation - easy to end up with, and already the case on this laptop -
+# then a bare `flatpak install flathub ...` cannot tell which one you mean. It
+# prompts to disambiguate, `-y` does NOT answer that prompt, and it exits 1:
+#     error: No remote chosen to resolve 'flathub' which exists in multiple
+#            installations
+# Under `set -e` that ended the script here and sections 11-14 never ran.
+# Naming the installation explicitly removes the ambiguity.
+sudo flatpak remote-add --system --if-not-exists flathub \
   https://flathub.org/repo/flathub.flatpakrepo
 
-flatpak install -y flathub com.github.dynobo.normcap
+# Captured to a variable rather than piped into `grep -qx`. `grep -q` exits on
+# its first match, killing the still-writing producer with SIGPIPE (141); under
+# `set -o pipefail` that 141 becomes the pipeline's status, so a SUCCESSFUL
+# match reported failure. The old form therefore answered "not installed"
+# precisely when NormCap WAS installed, and reinstalled it on every run.
+FLATPAK_SYS_APPS="$(flatpak list --system --app --columns=application 2>/dev/null || true)"
 
-ok "NormCap installed:  flatpak run com.github.dynobo.normcap"
-
-# If this machine previously ran the Flatpak variant of this setup, having two
-# OBS installs is confusing (and the Flatpak one still won't see your VSTs).
-if flatpak list --app 2>/dev/null | grep -q com.obsproject.Studio; then
-  warn "A Flatpak OBS is also installed. It cannot see /usr/lib/vst — its"
-  warn "manifest pins VST_PATH=/app/extensions/Plugins/vst. To avoid launching"
-  warn "the wrong one, consider removing it:"
-  warn "   flatpak uninstall com.obsproject.Studio com.obsproject.Studio.Plugin.DistroAV"
+if grep -qx com.github.dynobo.normcap <<<"$FLATPAK_SYS_APPS"; then
+  ok "NormCap already installed - skipping"
+else
+  sudo flatpak install --system -y flathub com.github.dynobo.normcap \
+    || fail "NormCap: flatpak install failed"
 fi
+
+ok "NormCap:  flatpak run com.github.dynobo.normcap"
+
+# The "a Flatpak OBS is also installed" warning moved to obs-vst-setup.sh,
+# which is where the deb-vs-Flatpak conflict actually matters.
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 section "11 · Communication & desktop apps"
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Telegram via snap (official, auto-updating)
-sudo snap install telegram-desktop
+# Telegram via snap (official, auto-updating).
+# `snap install` on an already-installed snap is not dependably a no-op across
+# snapd versions, and under `set -e` one unexpected non-zero here ends the run.
+# Ask first. Keeping it current is snapd's job, not this script's.
+if snap list telegram-desktop >/dev/null 2>&1; then
+  ok "telegram-desktop snap already installed - skipping"
+else
+  sudo snap install telegram-desktop || fail "telegram-desktop: snap install failed"
+fi
 
-# Zoom via official .deb
-wget -c https://zoom.us/client/latest/zoom_amd64.deb -O /tmp/zoom_amd64.deb
-sudo nala install -y /tmp/zoom_amd64.deb
-sudo apt --fix-broken install -y || true
-rm -f /tmp/zoom_amd64.deb
+# Zoom via official .deb, downloaded into $WORKDIR rather than /tmp with
+# `wget -c`: resuming into a fixed filename is exactly how you end up
+# installing a .deb that is half one release and half the next.
+if wget -q --show-progress -O "$WORKDIR/zoom_amd64.deb" \
+     https://zoom.us/client/latest/zoom_amd64.deb; then
+  sudo apt install -y "$WORKDIR/zoom_amd64.deb" || fail "Zoom: package install failed"
+  rm -f "$WORKDIR/zoom_amd64.deb"
+else
+  fail "Zoom: download failed - https://zoom.us/client/latest/zoom_amd64.deb"
+fi
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -484,7 +344,9 @@ gsettings set org.gnome.shell.extensions.dash-to-dock click-action 'minimize-or-
 NC_KEY_BASE='org.gnome.settings-daemon.plugins.media-keys.custom-keybinding'
 NC_PATH='/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/normcap/'
 
-existing=$(gsettings get org.gnome.settings-daemon.plugins.media-keys custom-keybindings)
+# Under `set -e` a failed gsettings read would end the script one section from
+# the finish line. An empty list is the correct fallback.
+existing="$(gsettings get org.gnome.settings-daemon.plugins.media-keys custom-keybindings 2>/dev/null || echo '@as []')"
 if [[ "$existing" != *"$NC_PATH"* ]]; then
   if [[ "$existing" == "@as []" || "$existing" == "[]" ]]; then
     updated="['$NC_PATH']"
@@ -509,6 +371,10 @@ section "14 · Ghostty terminal"
 sudo apt install -y ghostty
 
 
+# The OBS/plugin verification roll-up lives in obs-vst-setup.sh section 8.
+# Section 7 above already folded its exit status into this script's FAILURES.
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 section "✅  Setup complete"
 # ══════════════════════════════════════════════════════════════════════════════
@@ -517,9 +383,8 @@ cat <<'SUMMARY'
 Installed:
   • Dev:      VS Code · Git · Node (nvm + LTS) · NestJS · Turbo · Claude Code
   •           Docker CE + Compose plugin · Python 3 + pipx + auto-editor
-  • Media:    OBS Studio (deb, obsproject PPA)
-  •           OBS plugins: DistroAV (NDI) · Vertical Canvas · Source Record
-  •           LSP audio plugins (VST2 + LADSPA) - usable as OBS audio filters
+  • Media:    OBS Studio + VST rig - installed by obs-vst-setup.sh, which
+  •           printed its own summary and verification above
   •           Shotcut · ubuntu-restricted-extras
   • Comms:    Zoom · Telegram
   • Tools:    NormCap (OCR screen capture, Super+Shift+T)
@@ -532,39 +397,42 @@ Manual next steps:
      Reason: nvm is loaded by your shell rc file, and a script can't modify
      its parent shell's environment. New terminals will have it automatically.
   2. Log out and back in (or reboot) for Docker group membership to take effect.
-  3. NDI: the runtime was installed for you via DistroAV's libndi-get.sh
-     (the .deb does not bundle it, unlike the Flatpak). Verify with:
-         ldconfig -p | grep ndi
-     If that's empty, the download failed — launch OBS once and accept
-     DistroAV's prompt. Everything else works regardless.
-     Note: libndi-get.sh auto-accepted the NDI SDK EULA on your behalf.
-  4. Use the VSTs: in OBS pick an audio source → Filters → + →
-     "VST 2.x Plug-in" → choose e.g. "Graphic Equalizer x16 Mono" →
-     click "Open Plug-in Interface" for the full LSP UI.
-  5. NormCap: press Super+Shift+T, drag a region, text is in your clipboard.
+  3. NormCap: press Super+Shift+T, drag a region, text is in your clipboard.
      First run downloads nothing extra - English OCR data ships in the Flatpak.
      Extra languages: NormCap settings (gear icon) → Languages.
-  6. (Optional) Install GNOME extensions via Extension Manager:
+  4. (Optional) Install GNOME extensions via Extension Manager:
        - Dash to Panel (charlesg99)
        - Anything else you like
-  7. (Optional) Sign in to Claude Code:  claude  → /login
+  5. (Optional) Sign in to Claude Code:  claude  → /login
 
-If the VST list in OBS is empty:
-  - Confirm THIS OBS was built with VST support at all:
-       ls /usr/lib/x86_64-linux-gnu/obs-plugins/obs-vst.so
-    Missing means you are on the universe OBS, which has no VST filter.
-    Check the PPA took:  apt-cache policy obs-studio   (origin: obsproject)
-  - Confirm the plugin files exist (note the ".vst" suffix on the dir):
-       ls /usr/lib/vst/lsp-plugins.vst/ | head
-  - Confirm you launched the DEB OBS, not a leftover Flatpak:
-       which obs          # should be /usr/bin/obs
-       flatpak list | grep -i obs   # should be empty
-  - The Flatpak OBS pins VST_PATH into its sandbox and will NEVER see these.
+OBS, VSTs and NDI: see the obs-vst-setup.sh summary printed in section 7 above.
+It carries its own troubleshooting for an empty VST list and for NDI sources
+that don't appear on the LAN. To rebuild just that rig without re-running this
+whole script:
 
-If NDI sources don't appear on the LAN:
-  - Confirm libndi is present:  ldconfig -p | grep ndi
-  - Confirm both machines are on the same subnet
-  - Check:  systemctl status avahi-daemon
-  - Check:  avahi-browse -a   (should list local services)
+    ./obs-vst-setup.sh
 
 SUMMARY
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Did anything actually break?
+# ══════════════════════════════════════════════════════════════════════════════
+# Every optional step above is best-effort so that one dead download cannot cost
+# you a 20-minute run. This is where that bill comes due: without it the script
+# ends on a cheerful "Setup complete" whether or not OBS can load a single
+# plugin, and you find out mid-stream instead.
+if ((${#FAILURES[@]})); then
+  echo -e "${RED}══════════════════════════════════════════════════${RESET}"
+  echo -e "${RED}  ${#FAILURES[@]} step(s) did NOT complete:${RESET}"
+  for _f in "${FAILURES[@]}"; do
+    echo -e "${RED}    ✗ $_f${RESET}"
+  done
+  echo -e "${RED}══════════════════════════════════════════════════${RESET}"
+  echo
+  echo "Re-running this script is safe - everything already in place is a no-op,"
+  echo "so it retries only what is missing."
+  exit 1
+fi
+
+ok "All post-install checks passed."
