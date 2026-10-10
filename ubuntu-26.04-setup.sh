@@ -190,7 +190,20 @@ sudo nala install -y avahi-daemon ffmpeg
 sudo systemctl enable --now avahi-daemon
 
 # UFW rules for NDI. Only applied if ufw is installed AND active.
-if command -v ufw >/dev/null 2>&1 && sudo ufw status | grep -q "Status: active"; then
+#
+# Captured to a variable, NOT piped into `grep -q`. `grep -q` exits on its first
+# match, which closes the pipe and kills the still-writing producer with SIGPIPE
+# (exit 141). Under `set -o pipefail` that 141 becomes the pipeline's status, so
+# a SUCCESSFUL match reads as a failure. "Status: active" is the first line of
+# multi-line output, so the old form silently skipped these rules on exactly the
+# machines that had ufw active.
+if command -v ufw >/dev/null 2>&1; then
+  UFW_STATUS="$(sudo ufw status 2>/dev/null || true)"
+else
+  UFW_STATUS=""
+fi
+
+if [[ "$UFW_STATUS" == *"Status: active"* ]]; then
   info "Configuring UFW rules for NDI..."
   sudo ufw allow 5353/udp                  # mDNS (Avahi)
   sudo ufw allow 5959:5969/tcp

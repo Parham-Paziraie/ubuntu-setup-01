@@ -28,3 +28,21 @@ Best way: npm (official) — latest + self-updating                             
    
 # update pi + packages
    
+   
+____________
+
+
+
+curl -fsSL https://get.pnpm.io/install.sh | sh -
+
+If you hit this class of problem again with some other tool, the general cure is to carry globals forward when you upgrade Node:
+
+nvm install --lts --reinstall-packages-from=current
+
+
+______________________
+
+sudo apt update
+sudo apt install intel-media-va-driver-non-free
+sudo usermod -aG render $USER
+
